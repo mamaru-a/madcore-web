@@ -18,7 +18,7 @@
  */
 
 import * as openpgp from 'openpgp';
-import { log, setLogLevel, getLogLevel } from './lib/logger';
+import { log, setLogLevel, getLogLevel, addLogSink } from './lib/logger';
 import { MemoryStore, IndexedDBStore, type IDeltaChatStore, type StoredChat, type StoredMessage, type StoredContact, type StoredAccount, type ChatDraft } from './store';
 import { Transport } from './lib/transport';
 import { getFingerprintFromArmored } from './lib/crypto';
@@ -63,7 +63,9 @@ export type {
     FlagOperation,
     Viewtype,
     SDKConfig,
+    Connectivity,
 } from './types';
+export { ALL_DC_EVENTS, ALL_WS_ACTIONS } from './types';
 
 export type { GroupInfo } from './lib/group';
 export type { StoredContact, StoredMessage, ChatDraft } from './store';
@@ -95,6 +97,16 @@ import type {
 /** Generate a short random account ID */
 function generateAccountId(): string {
     return globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+}
+
+/** Browser-safe base64 encode (no Node Buffer) */
+function bytesToBase64(bytes: Uint8Array): string {
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
 }
 
 export interface IDeltaChatManager {
@@ -311,7 +323,19 @@ export class DeltaChatAccount {
             t.configure(serverUrl, { email, password });
             this.transports.set(serverUrl, t);
         }
+        // Bridge logger → DC_EVENT_INFO / WARNING / ERROR (browser-safe)
+        this.logUnsub = addLogSink((level, tag, msg) => {
+            if (level === 'info') {
+                this.emit('DC_EVENT_INFO', { event: 'DC_EVENT_INFO', data1: tag, data2: msg });
+            } else if (level === 'warn') {
+                this.emit('DC_EVENT_WARNING', { event: 'DC_EVENT_WARNING', data1: tag, data2: msg });
+            } else if (level === 'error') {
+                this.emit('DC_EVENT_ERROR', { event: 'DC_EVENT_ERROR', data1: tag, data2: msg });
+            }
+        });
     }
+
+    private logUnsub: (() => void) | null = null;
 
     /** Static factory to load an account from a store */
     static async fromStore(store: IDeltaChatStore): Promise<DeltaChatAccount | undefined> {
@@ -583,6 +607,11 @@ export class DeltaChatAccount {
 
         await t.connect(sinceUID);
         log.info('sdk', `Connected transport: ${targetUrl}`);
+        this.emit('DC_EVENT_CONNECTIVITY_CHANGED', {
+            event: 'DC_EVENT_CONNECTIVITY_CHANGED',
+            data1: 'connected',
+            data2: targetUrl,
+        });
     }
 
     /** @deprecated Use connect() instead */
@@ -616,6 +645,11 @@ export class DeltaChatAccount {
             for (const t of this.transports.values()) t.disconnect();
             this.transports.clear();
         }
+        this.emit('DC_EVENT_CONNECTIVITY_CHANGED', {
+            event: 'DC_EVENT_CONNECTIVITY_CHANGED',
+            data1: 'not_connected',
+            data2: serverUrl || 'all',
+        });
     }
 
     /** Fetch messages via primary transport (WS preferred, REST fallback) */
@@ -1237,6 +1271,12 @@ export class DeltaChatAccount {
             // Actually usually reactions are stored as a list.
             targetMsg.reactions.push({ reaction: opts.reaction, from: this.credentials.email, at: Date.now() });
             await this.store.saveMessage(targetMsg);
+            this.emit('DC_EVENT_REACTIONS_CHANGED', {
+                event: 'DC_EVENT_REACTIONS_CHANGED',
+                chatId: targetMsg.chatId,
+                msgId: targetMsgId,
+                message: targetMsg,
+            });
         }
     }
 
@@ -1531,7 +1571,18 @@ export class DeltaChatAccount {
     }
 
     private async handleIncomingSecureJoin(msg: ParsedMessage): Promise<void> {
-        return securejoinLib.handleIncomingSecureJoin(this.ctx(), msg, this.myInviteNumber, this.myAuthToken);
+        this.emit('DC_EVENT_SECUREJOIN_INVITER_PROGRESS', {
+            event: 'DC_EVENT_SECUREJOIN_INVITER_PROGRESS',
+            msg,
+            contactId: msg.from,
+            data1: msg.secureJoinStep,
+        });
+        try {
+            await securejoinLib.handleIncomingSecureJoin(this.ctx(), msg, this.myInviteNumber, this.myAuthToken);
+        } catch (e: any) {
+            // Inviter replies may fail offline / without peer key — progress event still stands
+            log.warn('sdk', `SecureJoin inviter step failed: ${e.message}`);
+        }
     }
 
     async secureJoin(uri: string): Promise<{
@@ -1587,25 +1638,66 @@ export class DeltaChatAccount {
         this.profilePhotoMime = mimeType;
         this.profilePhotoChanged = true;
         this.sentAvatarTo.clear();
+        this.emit('DC_EVENT_SELFAVATAR_CHANGED', {
+            event: 'DC_EVENT_SELFAVATAR_CHANGED',
+            data1: mimeType,
+            data2: base64Data ? base64Data.length : 0,
+        });
     }
 
-    async setProfilePhoto(filePath: string) {
-        // Node-specific, but using dynamic import to avoid breaking browser builds
-        try {
-            // @ts-ignore
-            const fs: any = await import('fs');
-            const data: any = fs.readFileSync(filePath);
-
-            const ext = filePath.split('.').pop()?.toLowerCase() || 'jpg';
-            const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
-            // Use a portable way to convert to b64 if Buffer is not available
-            const b64 = typeof (globalThis as any).Buffer !== 'undefined'
-                ? (globalThis as any).Buffer.from(data).toString('base64')
-                : ''; // Browser users should use setProfilePhotoB64 directly
-            this.setProfilePhotoB64(b64, mimeMap[ext] || 'image/jpeg');
-        } catch (e) {
-            log.error('sdk', 'setProfilePhoto is only available in Node.js environments:', e);
+    /**
+     * Set profile photo from browser-friendly sources.
+     * Prefer this over path-based APIs in web apps.
+     *
+     * Accepts:
+     * - `{ data: base64, mimeType? }` raw base64
+     * - `Blob` / `File` (browser File input)
+     * - `ArrayBuffer` / `Uint8Array`
+     * - data URI string (`data:image/png;base64,...`)
+     */
+    async setProfilePhoto(
+        input:
+            | string
+            | Blob
+            | ArrayBuffer
+            | Uint8Array
+            | { data: string; mimeType?: string },
+    ): Promise<void> {
+        // Object form: already base64
+        if (input && typeof input === 'object' && !(input instanceof Blob) && !(input instanceof ArrayBuffer) && !(input instanceof Uint8Array) && 'data' in input) {
+            this.setProfilePhotoB64(input.data, input.mimeType || 'image/jpeg');
+            return;
         }
+
+        // data URI
+        if (typeof input === 'string' && input.startsWith('data:')) {
+            const m = input.match(/^data:([^;]+);base64,(.+)$/);
+            if (!m) throw new Error('Invalid data URI for profile photo');
+            this.setProfilePhotoB64(m[2], m[1] || 'image/jpeg');
+            return;
+        }
+
+        // bare base64 string
+        if (typeof input === 'string') {
+            this.setProfilePhotoB64(input, 'image/jpeg');
+            return;
+        }
+
+        // Blob / File
+        if (typeof Blob !== 'undefined' && input instanceof Blob) {
+            const buf = new Uint8Array(await input.arrayBuffer());
+            const b64 = bytesToBase64(buf);
+            this.setProfilePhotoB64(b64, input.type || 'image/jpeg');
+            return;
+        }
+
+        // ArrayBuffer / Uint8Array
+        let bytes: Uint8Array;
+        if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+        else if (input instanceof Uint8Array) bytes = input;
+        else throw new Error('Unsupported profile photo input (use base64, Blob, or ArrayBuffer)');
+
+        this.setProfilePhotoB64(bytesToBase64(bytes), 'image/jpeg');
     }
 
 
@@ -1785,9 +1877,7 @@ export class DeltaChatAccount {
 
     /** Handle a WS push message (new_message) */
     private async handlePushMessage(summary: any): Promise<void> {
-        if (this.seenUIDs.has(summary.uid)) return;
-        this.seenUIDs.add(summary.uid);
-
+        // Dedup is handled inside processIncomingRaw
         let raw: IncomingMessage;
         try {
             const detail = await this.transport.wsRequest('fetch', { uid: summary.uid });
@@ -1795,6 +1885,21 @@ export class DeltaChatAccount {
         } catch {
             raw = await this.transport.fetchMessage(summary.uid);
         }
+
+        await this.processIncomingRaw(raw);
+    }
+
+    /**
+     * Process a raw inbound MIME message (parse, events, store).
+     * Used by the WebSocket push path and by browser tests / custom transports.
+     * Web-compatible — no Node APIs.
+     */
+    async processIncomingRaw(raw: IncomingMessage): Promise<ParsedMessage | null> {
+        if (raw.uid != null && this.seenUIDs.has(raw.uid)) {
+            // allow re-process with uid=0 for tests
+            if (raw.uid !== 0) return null;
+        }
+        if (raw.uid != null && raw.uid !== 0) this.seenUIDs.add(raw.uid);
 
         for (const h of this.rawHandlers) h(raw);
 
@@ -1813,7 +1918,7 @@ export class DeltaChatAccount {
                 this.isBlocked(parsed.from)
             ) {
                 log.info('sdk', `Dropping message from blocked contact ${parsed.from}`);
-                return;
+                return null;
             }
 
             // Inviter-side SecureJoin auto-response
@@ -1856,7 +1961,7 @@ export class DeltaChatAccount {
                             data1: signal,
                         });
                     }
-                    return; // do not store as chat bubble
+                    return parsed; // do not store as chat bubble
                 }
             }
 
@@ -1880,7 +1985,7 @@ export class DeltaChatAccount {
                         contactId: parsed.from,
                     });
                 }
-                return;
+                return parsed;
             }
 
             // Location points
@@ -1905,7 +2010,7 @@ export class DeltaChatAccount {
                         data1: parsed.text,
                     });
                 }
-                return;
+                return parsed;
             }
 
             // Emit DC_EVENT_* events
@@ -1930,6 +2035,7 @@ export class DeltaChatAccount {
             }
             await this.storeIncomingMessage(parsed);
         }
+        return parsed;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

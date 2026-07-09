@@ -448,6 +448,28 @@ export type DCEvent =
     | 'DC_EVENT_WARNING'
     | 'DC_EVENT_ERROR';
 
+/** Exhaustive list of SDK events (keep in sync with `DCEvent`) */
+export const ALL_DC_EVENTS: readonly DCEvent[] = [
+    'DC_EVENT_INCOMING_MSG',
+    'DC_EVENT_INCOMING_REACTION',
+    'DC_EVENT_MSG_DELETED',
+    'DC_EVENT_MSG_READ',
+    'DC_EVENT_MSGS_CHANGED',
+    'DC_EVENT_SECUREJOIN_INVITER_PROGRESS',
+    'DC_EVENT_SECUREJOIN_JOINER_PROGRESS',
+    'DC_EVENT_SELFAVATAR_CHANGED',
+    'DC_EVENT_CONTACTS_CHANGED',
+    'DC_EVENT_REACTIONS_CHANGED',
+    'DC_EVENT_WEBXDC_STATUS_UPDATE',
+    'DC_EVENT_LOCATION_CHANGED',
+    'DC_EVENT_INCOMING_CALL',
+    'DC_EVENT_CALL_ENDED',
+    'DC_EVENT_CONNECTIVITY_CHANGED',
+    'DC_EVENT_INFO',
+    'DC_EVENT_WARNING',
+    'DC_EVENT_ERROR',
+] as const;
+
 /**
  * Data payload for SDK events.
  *
@@ -582,6 +604,22 @@ export type WSAction =
     | 'create_mailbox'
     | 'delete_mailbox'
     | 'rename_mailbox';
+
+/** Exhaustive list of relay WebSocket actions (keep in sync with `WSAction`) */
+export const ALL_WS_ACTIONS: readonly WSAction[] = [
+    'send',
+    'fetch',
+    'list_mailboxes',
+    'list_messages',
+    'flags',
+    'delete',
+    'move',
+    'copy',
+    'search',
+    'create_mailbox',
+    'delete_mailbox',
+    'rename_mailbox',
+] as const;
 
 /**
  * Mailbox information returned by `list_mailboxes`.

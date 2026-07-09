@@ -94,8 +94,14 @@ export function extractBody(rawMessage: string): string {
 
     let body = m.substring(splitIdx + 1).trim();
 
-    // If it's a non-text child part of a multipart, don't return it as "the" body
-    if (!contentType.startsWith('text/plain') && !contentType.includes('text/html')) {
+    // If it's a non-text child part of a multipart, don't return it as "the" body.
+    // Allow JSON control payloads (calls, location, webxdc status) used by the web SDK.
+    const allowBody =
+        contentType.startsWith('text/plain') ||
+        contentType.includes('text/html') ||
+        contentType.includes('application/json') ||
+        contentType.includes('text/json');
+    if (!allowBody) {
         // If this part has headers (detected by colons in the header section before separator)
         if (m.substring(0, splitIdx).includes(':')) return '';
     }
@@ -309,7 +315,23 @@ export async function parseIncoming(raw: IncomingMessage, ctx: ParseContext): Pr
             text = `[Decryption failed: ${e.message}]`;
         }
     } else {
-        text = extractBody(rawBody);
+        // Prefer full-message extract; fall back to raw body for JSON control payloads
+        // (extractBody on body-only JSON returns '' because of bare "key: value" colons).
+        text = extractBody(body);
+        if (!text && rawBody.trim()) {
+            text = rawBody.trim();
+        }
+        // Unencrypted control messages (tests + rare cleartext)
+        if (
+            /content-disposition:\s*reaction/i.test(body) ||
+            (headers['content-disposition'] || '').toLowerCase() === 'reaction'
+        ) {
+            isReaction = true;
+        }
+        if (headers['chat-delete']) {
+            isDelete = true;
+            text = headers['chat-delete'];
+        }
     }
 
     // Extract group/chat context from inner headers (preferred) or outer

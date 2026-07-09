@@ -1,86 +1,71 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { DeltaChatSDK } from '../../sdk'
+/**
+ * Core RPC surface — offline / browser-compatible.
+ * Live relay tests live in `test/live-madmail.ts` (env-driven).
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { DeltaChatSDK, ALL_DC_EVENTS, ALL_WS_ACTIONS } from '../../sdk'
 import { MemoryStore } from '../../store'
+import { installMockWebSocket, buildRawMime, waitForEvent } from './helpers/web'
 
-const SERVER = process.env.SERVER_URL || process.env.CHATMAIL_DOMAIN || 'https://testrun.org'
-
-describe('Delta Chat RPC Core', () => {
-  let dc: ReturnType<typeof DeltaChatSDK>
+describe('Delta Chat RPC Core (web-compatible)', () => {
   let account: any
+  let restore: (() => void) | null = null
 
-  beforeAll(async () => {
-    dc = DeltaChatSDK({ logLevel: 'error', store: new MemoryStore() })
-    try {
-      const result = await dc.register(SERVER, 'RPC Test User')
-      account = result.account
-      await account.connect()
-    } catch (e: any) {
-      if (e.message.includes('404')) {
-        console.warn('⚠️  No live relay available — running offline tests only')
-        // Continue with skipped live tests
-      } else {
-        throw e
-      }
-    }
+  beforeEach(() => {
+    restore = installMockWebSocket()
+    const dc = DeltaChatSDK({ logLevel: 'error', store: new MemoryStore() })
+    account = dc.addAccount('alice@relay.example', 'pass', 'https://relay.example')
   })
 
-  afterAll(() => {
-    if (account) account.disconnect()
+  afterEach(() => {
+    account?.disconnect?.()
+    restore?.()
   })
 
-  it('should get system info via RPC-like interface', async () => {
-    if (!account) {
-      // offline mode
-      return
-    }
+  it('exposes exhaustive event + WS action registries', () => {
+    expect(ALL_DC_EVENTS.length).toBeGreaterThanOrEqual(18)
+    expect(ALL_WS_ACTIONS.length).toBe(12)
+  })
+
+  it('status() returns account shape without network', () => {
     const status = account.status()
     expect(status).toHaveProperty('id')
     expect(status).toHaveProperty('email')
-    expect(status.isConnected).toBe(true)
+    expect(status.email).toBe('alice@relay.example')
   })
 
-  it('should send and receive a text message', async () => {
-    if (!account) {
-      // offline mode - test high-level API structure only
-      expect(typeof account?.send).toBe('function')
-      return
-    }
-    // This will be expanded with full RPC once client is implemented
-    const testMsg = `RPC test ${Date.now()}`
-    const selfContact = { email: account.credentials.email }
+  it('connects via MockWebSocket and lists mailboxes', async () => {
+    await account.connect('https://relay.example')
+    await new Promise(r => setTimeout(r, 15))
+    expect(account.status().isConnected).toBe(true)
+    const mboxes = await account.wsRequest('list_mailboxes', {})
+    expect(Array.isArray(mboxes)).toBe(true)
+  })
 
-    await expect(account.send(selfContact, { text: testMsg })).resolves.toBeDefined()
-
-    // Listen for echo (self-message)
-    const received = await new Promise<any>((resolve) => {
-      const handler = (msg: any) => {
-        if (msg.text?.includes('RPC test')) resolve(msg)
-      }
-      account.on('DC_EVENT_INCOMING_MSG', handler)
-      setTimeout(() => resolve(null), 3000)
+  it('processIncomingRaw delivers DC_EVENT_INCOMING_MSG', async () => {
+    const p = waitForEvent(account, 'DC_EVENT_INCOMING_MSG')
+    await account.processIncomingRaw({
+      uid: 0,
+      body: buildRawMime({
+        from: 'bob@relay.example',
+        to: 'alice@relay.example',
+        body: 'RPC test hello',
+      }),
     })
-
-    if (received) {
-      expect(received.text).toContain('RPC test')
-    }
+    const e: any = await p
+    expect(e.msg.text).toContain('RPC test hello')
   })
 
-  it('should support secure join flow', async () => {
-    if (!account) {
-      expect(typeof account?.generateSecureJoinURI).toBe('function')
-      return
-    }
-    const uri = account.generateSecureJoinURI()
-    expect(uri).toContain('https://')
-    expect(uri).toContain('securejoin')
-  })
-
-  it('should list chats (future RPC getAllChats)', async () => {
-    if (!account) {
-      expect(typeof account?.store?.getAllChats).toBe('function')
-      return
-    }
-    const chats = await account.store.getAllChats()
+  it('getChatList is available', async () => {
+    const chats = await account.getChatList()
     expect(Array.isArray(chats)).toBe(true)
   })
+
+  it('capabilities() is web-shaped', () => {
+    const caps = account.capabilities()
+    expect(caps.webxdc).toBe(true)
+    expect(caps.location).toBe(true)
+    expect(['webrtc', 'signaling-only', 'none']).toContain(caps.calls)
+  })
 })
+

@@ -150,10 +150,9 @@ async function main() {
         }
 
         try {
-            const tiny = Buffer.from(
-                'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-                'base64',
-            ).toString('base64');
+            // Tiny 1×1 PNG base64 (web-safe, no Node Buffer)
+            const tiny =
+                'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
             const sent = await account.send(contact, {
                 sticker: { data: tiny, mimeType: 'image/png', filename: 'dot.png' },
             });
