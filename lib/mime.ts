@@ -334,6 +334,66 @@ export async function parseIncoming(raw: IncomingMessage, ctx: ParseContext): Pr
     const editHeader = innerHeaders['chat-edit'] || headers['chat-edit'] || '';
     const isEdit = editHeader.length > 0;
 
+    // Read receipts (disposition notifications)
+    const disposition = (innerHeaders['chat-disposition'] || headers['chat-disposition'] || '').toLowerCase();
+    const originalMsgId =
+        innerHeaders['original-message-id'] ||
+        headers['original-message-id'] ||
+        '';
+    const isReadReceipt = disposition === 'display' && originalMsgId.length > 0;
+
+    // Ephemeral timer (control message or sticky on chat)
+    const ephemeralRaw = innerHeaders['chat-ephemeral-timer'] || headers['chat-ephemeral-timer'];
+    const ephemeralTimer = ephemeralRaw !== undefined && ephemeralRaw !== ''
+        ? parseInt(ephemeralRaw, 10)
+        : undefined;
+
+    // Group avatar (Chat-Group-Avatar: base64:… | 0)
+    let groupAvatarUpdate: string | null | undefined = undefined;
+    const groupAvatarHeader = innerHeaders['chat-group-avatar'] || headers['chat-group-avatar'];
+    if (groupAvatarHeader) {
+        if (groupAvatarHeader === '0') {
+            groupAvatarUpdate = null;
+        } else if (groupAvatarHeader.startsWith('base64:')) {
+            const b64 = groupAvatarHeader.substring('base64:'.length).replace(/\s/g, '');
+            groupAvatarUpdate = `data:image/jpeg;base64,${b64}`;
+        }
+    }
+
+    // Stickers / GIFs / webxdc / location / calls (Chat-Content or attachment MIME)
+    const chatContent = (innerHeaders['chat-content'] || headers['chat-content'] || '').toLowerCase();
+    const isSticker = chatContent === 'sticker';
+    const firstAttMime = attachments[0]?.mimeType?.toLowerCase() || '';
+    const isGif = chatContent === 'gif' || firstAttMime === 'image/gif';
+    const isWebxdc = chatContent === 'app' || firstAttMime === 'application/webxdc'
+        || (attachments[0]?.filename || '').endsWith('.xdc');
+    const isWebxdcStatus = chatContent === 'webxdc-status';
+    const isLocation = chatContent === 'location' || chatContent === 'location-stream';
+    const isCall = chatContent === 'call';
+
+    // Best-effort viewtype for UI consumers
+    let viewtype: import('../types').Viewtype | undefined;
+    if (isReaction || isDelete || isEdit || isSecureJoin || isReadReceipt || isWebxdcStatus || isCall) {
+        viewtype = undefined;
+    } else if (isWebxdc) {
+        viewtype = 'Webxdc';
+    } else if (isSticker) {
+        viewtype = 'Sticker';
+    } else if (isGif) {
+        viewtype = 'Gif';
+    } else if (isVoiceMessage) {
+        viewtype = 'Voice';
+    } else if (attachments.length > 0) {
+        if (firstAttMime.startsWith('video/')) viewtype = 'Video';
+        else if (firstAttMime.startsWith('audio/')) viewtype = 'Audio';
+        else if (firstAttMime.startsWith('image/')) viewtype = 'Image';
+        else viewtype = 'File';
+    } else if (isLocation) {
+        viewtype = undefined;
+    } else {
+        viewtype = 'Text';
+    }
+
     return {
         uid: raw.uid,
         rfc724mid,
@@ -363,5 +423,18 @@ export async function parseIncoming(raw: IncomingMessage, ctx: ParseContext): Pr
         memberRemoved,
         isEdit,
         editTargetMsgId: isEdit ? editHeader : undefined,
+        isReadReceipt,
+        readReceiptFor: isReadReceipt ? originalMsgId : undefined,
+        ephemeralTimer: ephemeralTimer !== undefined && !Number.isNaN(ephemeralTimer)
+            ? ephemeralTimer
+            : undefined,
+        groupAvatarUpdate,
+        isSticker,
+        isGif,
+        isWebxdc,
+        isWebxdcStatus,
+        isLocation,
+        isCall,
+        viewtype,
     };
 }
